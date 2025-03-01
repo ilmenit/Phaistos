@@ -1,0 +1,19 @@
+; Example: Code optimization
+; This demonstrates identifying redundant operations
+
+MEMORY_IN:
+  0x20: 0x??   ; Memory location that will store result
+
+OPTIMIZE:
+  0x1000:
+    0xA9 0x00   ; LDA #$00
+    0x18        ; CLC
+    0x69 0x01   ; ADC #$01
+    0x69 0x01   ; ADC #$01
+    0x85 0x20   ; STA $20
+    END
+
+RUN: 0x1000
+
+MEMORY_OUT:
+  0x20: 0x02    ; Result must be 2

@@ -1,0 +1,50 @@
+; Example: Fast 8-bit multiplication
+; This demonstrates optimizing multiplication to find the fastest implementation
+
+OPTIMIZE_FOR: speed
+
+CPU_IN:
+  A: 0x??      ; First operand (multiplicand)
+  X: 0x??      ; Second operand (multiplier)
+  Y: 0x00      ; Will be used for high byte of product
+
+FLAGS_IN:
+  C: 0         ; Clear carry
+  Z: ?         ; Don't care
+  I: 1         ; Interrupt disable set
+  D: 0         ; Decimal mode off
+  V: ?         ; Don't care
+  N: ?         ; Don't care
+
+OPTIMIZE:
+  0x1000:
+    0xA8        ; TAY (save A in Y temporarily)
+    0xA9 0x00   ; LDA #$00 (initialize result)
+    0x8D 0x50 0x00 ; STA $0050 (store low byte of result)
+    0x8D 0x51 0x00 ; STA $0051 (store high byte of result)
+    0x98        ; TYA (restore A)
+    
+    ; Multiplication loop
+    0xC6 0x50   ; LOOP: DEC $0050 (loop counter)
+    0x30 0x0A   ; BMI DONE (branch if negative, i.e., done)
+    0x18        ; CLC
+    0x8A        ; TXA (get multiplier)
+    0x6D 0x51 0x00 ; ADC $0051 (add to result)
+    0x8D 0x51 0x00 ; STA $0051 (store result)
+    0x4C 0x06 0x10 ; JMP LOOP
+    
+    ; Done
+    0xAD 0x51 0x00 ; DONE: LDA $0051 (load low byte of result)
+    0xA8        ; TAY (put high byte in Y)
+    0xAD 0x50 0x00 ; LDA $0050 (load low byte of result)
+    END
+
+RUN: 0x1000
+
+CPU_OUT:
+  A: 0x??      ; Low byte of product
+  Y: 0x??      ; High byte of product
+
+MEMORY_OUT:
+  0x50: 0x??   ; Used for calculation
+  0x51: 0x??   ; Used for calculation

@@ -1,0 +1,29 @@
+; Example: 16-bit increment optimization
+; This demonstrates optimizing a simple 16-bit increment operation
+
+OPTIMIZE_FOR: size
+
+FLAGS_IN:
+  D: 0         ; Decimal mode off
+
+MEMORY_IN:
+  0x80: 0x?? 0x??  ; 16-bit value in zero page
+
+OPTIMIZE:
+  0x1000:
+    0x18        ; CLC
+    0xA5 0x80   ; LDA $80
+    0x69 0x01   ; ADC #$01
+    0x85 0x80   ; STA $80
+    0xA5 0x81   ; LDA $81
+    0x69 0x00   ; ADC #$00
+    0x85 0x81   ; STA $81
+    END
+
+RUN: 0x1000
+
+FLAGS_OUT:
+  D: SAME      ; Decimal mode should remain off
+
+MEMORY_OUT:
+  0x80: 0x?? 0x??  ; 16-bit value must be incremented by 1

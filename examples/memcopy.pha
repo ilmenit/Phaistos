@@ -1,0 +1,31 @@
+; Example: Memory block copy optimization
+; This demonstrates optimizing a memory copy routine
+
+OPTIMIZE_FOR: size
+
+CPU_IN:
+  X: 0x00      ; Will be used as index
+  Y: 0x??      ; Length of copy (1-128 bytes)
+
+MEMORY_IN:
+  0x0200: 0x?? [128]  ; Source data (128 bytes)
+  0x0300: 0x?? [128]  ; Destination (128 bytes)
+
+OPTIMIZE:
+  0x1000:
+    0xA0 0x00   ; LDY #$00 (reset index)
+    0xBD 0x00 0x02 ; LOOP: LDA $0200,X (load from source)
+    0x9D 0x00 0x03 ; STA $0300,X (store to destination)
+    0xE8        ; INX
+    0xC4 0x02   ; CPY $02 (compare with length)
+    0xD0 0xF7   ; BNE LOOP
+    END
+
+RUN: 0x1000
+
+CPU_OUT:
+  X: 0x??      ; Don't care about final register state
+  Y: 0x??      ; Don't care about final register state
+
+MEMORY_OUT:
+  0x0300: 0x?? [128]  ; Destination should contain copied data

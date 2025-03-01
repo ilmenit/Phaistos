@@ -1,0 +1,25 @@
+; Example: Hardware register handling
+; This demonstrates working with memory-mapped hardware registers
+
+OPTIMIZE_FOR: size
+
+MEMORY_IN:
+  0x80: 0x?? 0x??  ; Sprite X,Y coordinates in zero page
+
+OPTIMIZE:
+  0x1000:
+    0xA5 0x80   ; LDA $80
+    0x8D 0x00 0xD0  ; STA $D000 (Sprite 0 X)
+    0xA5 0x81   ; LDA $81
+    0x8D 0x01 0xD0  ; STA $D001 (Sprite 0 Y)
+    0xA9 0x01   ; LDA #$01
+    0x8D 0x15 0xD0  ; STA $D015 (Sprite enable)
+    END
+
+RUN: 0x1000
+
+MEMORY_OUT:
+  0x80: SAME SAME  ; Coordinates should be preserved
+  0xD000: 0x??     ; Final X coordinate value
+  0xD001: 0x??     ; Final Y coordinate value
+  0xD015: 0x01     ; Sprite 0 enabled
