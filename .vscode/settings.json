@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "regex": "cpp",
+        "chrono": "cpp",
+        "format": "cpp",
+        "thread": "cpp",
+        "vector": "cpp",
+        "iomanip": "cpp"
+    }
+}

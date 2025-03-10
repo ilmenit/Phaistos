@@ -3,6 +3,7 @@
  * @brief Implementation of the sequence generator
  */
 #include "sequence_generator.hpp"
+#include "logger.hpp"
 
 namespace phaistos {
 
@@ -58,19 +59,30 @@ bool SequenceGenerator::next(std::vector<uint8_t>& sequence) {
 }
 
 void SequenceGenerator::generateSequencesOfLength(size_t length) {
+    Logger& logger = getLogger();
+    logger.debug("Generating sequences of length " + std::to_string(length));
+    
     current_sequences.clear();
     
     // Start with empty sequence
     std::vector<uint8_t> base;
     generateSequencesRecursive(base, length);
     
+    logger.debug("Generated " + std::to_string(current_sequences.size()) + " raw sequences");
+    
     // Apply pruning
+    logger.debug("Applying pruning rules");
     pruneInvalidSequences();
+    logger.debug("After pruning: " + std::to_string(current_sequences.size()) + " sequences remain");
     
     // Limit the number of sequences to avoid explosion
     if (current_sequences.size() > 10000) {
+        logger.debug("Limiting sequence count to 10000 (was " + std::to_string(current_sequences.size()) + ")");
         current_sequences.resize(10000);
     }
+    
+    logger.debug("Final sequence count for length " + std::to_string(length) + ": " + 
+                std::to_string(current_sequences.size()));
 }
 
 void SequenceGenerator::generateSequencesRecursive(std::vector<uint8_t>& current, size_t remaining_bytes) {
@@ -147,6 +159,9 @@ SequenceGenerator::InstructionInfo SequenceGenerator::getInstructionInfo(uint8_t
 }
 
 void SequenceGenerator::pruneInvalidSequences() {
+    Logger& logger = getLogger();
+    logger.debug("Pruning invalid sequences from " + std::to_string(current_sequences.size()) + " sequences");
+    
     std::vector<std::vector<uint8_t>> valid_sequences;
     
     for (const auto& seq : current_sequences) {
@@ -155,6 +170,7 @@ void SequenceGenerator::pruneInvalidSequences() {
         }
     }
     
+    logger.debug("Pruned " + std::to_string(current_sequences.size() - valid_sequences.size()) + " sequences");
     current_sequences = std::move(valid_sequences);
 }
 

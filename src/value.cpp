@@ -3,6 +3,7 @@
  * @brief Implementation of the Value class
  */
 #include "value.hpp"
+#include "logger.hpp"
 
 namespace phaistos {
 
@@ -11,7 +12,7 @@ namespace phaistos {
  * @param text String representation of a number
  * @return Parsed numeric value
  */
-static uint8_t parseNumeric(const std::string& text) {
+uint8_t parseNumeric(const std::string& text) {
     if (text.empty()) {
         throw std::runtime_error("Empty value string");
     }
@@ -52,27 +53,33 @@ static uint8_t parseNumeric(const std::string& text) {
 }
 
 Value Value::parse(const std::string& text) {
+    // Get the logger for debugging
+    Logger& logger = getLogger();
+    logger.debug("Parsing value from string: '" + text + "'");
+
     // Handle ANY variants
-    if (text == "??" || text == "?" || text == "ANY") {
+    if (text == "??" || text == "?" || text == "ANY" || 
+        text.find("0x?") != std::string::npos ||
+        text.find("$?") != std::string::npos) {
+        logger.debug("  Detected ANY value");
         return any();
     }
     
     // Handle SAME keyword for preservation
     if (text == "SAME") {
+        logger.debug("  Detected SAME value");
         return same();
     }
     
-    // Handle 0x? or $? notation
-    if ((text.size() >= 3 && text.substr(0, 2) == "0x" && 
-         text.substr(2) == "?") ||
-        (text.size() >= 2 && text[0] == '$' && 
-         text.substr(1) == "?")) {
-        return any();
-    }
-    
     // Parse as exact value
-    uint8_t value = parseNumeric(text);
-    return exact(value);
+    try {
+        uint8_t value = parseNumeric(text);
+        logger.debug("  Parsed as EXACT value: 0x" + std::to_string(static_cast<int>(value)));
+        return exact(value);
+    } catch (const std::exception& e) {
+        logger.error("  Failed to parse numeric value: " + std::string(e.what()));
+        throw std::runtime_error("Failed to parse value '" + text + "': " + e.what());
+    }
 }
 
 } // namespace phaistos

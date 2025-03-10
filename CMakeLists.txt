@@ -23,8 +23,9 @@ find_package(Threads REQUIRED)
 
 # Source files
 set(SOURCES
-    src/cpu.cpp
+    src/logger.cpp
     src/main.cpp
+    src/cpu.cpp
     src/optimizer.cpp
     src/parser.cpp
     src/sequence_generator.cpp

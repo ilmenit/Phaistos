@@ -3,6 +3,7 @@
  * @brief Implementation of the core optimization engine
  */
 #include "optimizer.hpp"
+#include "logger.hpp"
 
 namespace phaistos {
 
@@ -13,106 +14,150 @@ Optimizer<AddressT>::Optimizer(const OptimizationSpec<AddressT>& spec)
 
 template<typename AddressT>
 std::vector<uint8_t> Optimizer<AddressT>::optimize(int timeout_seconds) {
+    Logger& logger = getLogger();
+    logger.debug("Starting optimization process");
+
     // Configure sequence generator
+    logger.debug("Configuring sequence generator with max length: 32");
     generator.setMaxLength(32);  // Start with a reasonable limit
-    
+
     // Use CPU architecture to determine valid opcodes
+    logger.debug("Getting valid opcodes for CPU architecture");
     std::vector<uint8_t> valid_opcodes = getAllValidOpcodes();
+    logger.debug("Found " + std::to_string(valid_opcodes.size()) + " valid opcodes");
     generator.setValidOpcodes(valid_opcodes);
-    
+
     // Initialize cache
+    logger.debug("Clearing transformation cache");
     cache.clear();
-    
+
     // Set timeout
     auto start_time = std::chrono::steady_clock::now();
     auto end_time = start_time + std::chrono::seconds(timeout_seconds);
-    
+    logger.debug("Set timeout to " + std::to_string(timeout_seconds) + " seconds");
+
     // Track best solution
     std::vector<uint8_t> best_solution;
     size_t best_metric = std::numeric_limits<size_t>::max();
-    
+
     // Statistics
     size_t sequences_tested = 0;
     size_t valid_sequences_found = 0;
     bool done = false;
-    
+
     // Optimization loop
+    logger.debug("Starting main optimization loop");
     std::vector<uint8_t> candidate;
     while (!done && generator.next(candidate)) {
         // Check timeout
         auto now = std::chrono::steady_clock::now();
         if (now > end_time) {
+            logger.debug("Timeout reached after testing " + std::to_string(sequences_tested) + " sequences");
             if (progress_listener) {
                 progress_listener->onProgress(sequences_tested, valid_sequences_found, cache.size());
             }
             break;
         }
-        
+
+        // Log every 1000 sequences at debug level
+        if (sequences_tested % 1000 == 0) {
+            logger.debug("Processing sequence #" + std::to_string(sequences_tested) +
+                " (length: " + std::to_string(candidate.size()) + " bytes)");
+        }
+
         // Try to optimize using cache first
+        logger.debug("Optimizing candidate using cache");
         std::vector<uint8_t> optimized = optimizeWithCache(candidate);
-        
+
         // Verify this sequence
         sequences_tested++;
-        
+        logger.debug("Verifying optimized sequence (" + std::to_string(optimized.size()) + " bytes)");
+
         if (verifier.verify(optimized)) {
             valid_sequences_found++;
-            
+            logger.debug("Sequence verified successfully! Valid sequence #" + std::to_string(valid_sequences_found));
+
             // Calculate metric based on goal
             size_t metric;
             if (spec.goal == OptimizationSpec<AddressT>::SIZE) {
                 metric = verifier.getSize(optimized);
-            } else {
-                metric = verifier.getCycles(optimized);
+                logger.debug("Size metric: " + std::to_string(metric) + " bytes");
             }
-            
+            else {
+                metric = verifier.getCycles(optimized);
+                logger.debug("Speed metric: " + std::to_string(metric) + " cycles");
+            }
+
             // Update if better
             if (metric < best_metric) {
+                logger.debug("New best solution found! Previous metric: " + std::to_string(best_metric) +
+                    ", new metric: " + std::to_string(metric));
                 best_solution = optimized;
                 best_metric = metric;
-                
+
                 if (progress_listener) {
                     progress_listener->onNewBestSolution(best_solution, metric, sequences_tested);
                 }
-                
+
                 // If optimizing for size, we can stop once we find any valid solution
                 // since we're generating sequences in order of increasing length
                 if (spec.goal == OptimizationSpec<AddressT>::SIZE) {
+                    logger.debug("Optimization goal is SIZE, found optimal solution, stopping search");
                     done = true;
                     break;
                 }
-                
+
                 // For speed optimization, we should continue searching but can limit the search space
                 if (spec.goal == OptimizationSpec<AddressT>::SPEED) {
                     // Limit to sequences no more than 4 bytes larger than the best solution
+                    logger.debug("Optimization goal is SPEED, limiting search to max length: " +
+                        std::to_string(best_solution.size() + 4));
                     generator.setMaxLength(best_solution.size() + 4);
-                    
-                    // If we find a sequence significantly larger than the best solution,
-                    // we can stop the search
-                    if (optimized.size() > best_solution.size() + 4) {
-                        done = true;
-                        break;
-                    }
                 }
             }
-            
+            else {
+                logger.debug("Solution valid but not better than current best (metric: " +
+                    std::to_string(metric) + " vs best: " + std::to_string(best_metric) + ")");
+
+                // Check if we should stop the search when the current solution is NOT better than the best solution
+                if (spec.goal == OptimizationSpec<AddressT>::SPEED &&
+                    optimized.size() > best_solution.size() + 4) {
+                    logger.debug("Sequence is significantly larger than best solution, stopping search");
+                    done = true;
+                    break;
+                }
+            }
+
             // Add to cache for future use
+            logger.debug("Adding sequence to transformation cache");
             auto key = extractTransformation(optimized);
             cache.add(key, optimized, verifier.getCycles(optimized));
         }
-        
+        else {
+            logger.debug("Sequence verification failed");
+        }
+
         // Report progress periodically
         if (progress_listener && sequences_tested % 1000 == 0) {
+            logger.debug("Reporting progress after " + std::to_string(sequences_tested) + " sequences");
             progress_listener->onProgress(sequences_tested, valid_sequences_found, cache.size());
         }
     }
-    
+
     // Final progress report
     if (progress_listener) {
+        logger.debug("Final progress report");
         progress_listener->onProgress(sequences_tested, valid_sequences_found, cache.size());
     }
-    
+
+    logger.debug("Optimization completed. Tested " + std::to_string(sequences_tested) +
+        " sequences, found " + std::to_string(valid_sequences_found) + " valid sequences");
+    logger.debug("Best solution size: " + std::to_string(best_solution.size()) + " bytes");
+    logger.debug("Best solution metric: " + std::to_string(best_metric));
+
     return best_solution;
 }
+
 
 template<typename AddressT>
 void Optimizer<AddressT>::setProgressListener(ProgressListener* listener) {
@@ -352,16 +397,32 @@ void ConsoleProgressListener::onNewBestSolution(
     size_t metric, 
     size_t sequences_tested) {
     
-    std::cout << "New best solution found after testing " << sequences_tested << " sequences:" << std::endl;
-    std::cout << "  Size: " << solution.size() << " bytes" << std::endl;
-    std::cout << "  Metric: " << metric << std::endl;
+    Logger& logger = getLogger();
+    
+    std::ostringstream msg;
+    msg << "New best solution found after testing " << sequences_tested << " sequences:";
+    logger.info(msg.str());
+    
+    msg.str("");
+    msg << "  Size: " << solution.size() << " bytes";
+    logger.info(msg.str());
+    
+    msg.str("");
+    msg << "  Metric: " << metric;
+    logger.info(msg.str());
     
     // Print bytes as hex
-    std::cout << "  Bytes: ";
+    msg.str("");
+    msg << "  Bytes: ";
     for (uint8_t b : solution) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b) << " ";
+        msg << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b) << " ";
     }
-    std::cout << std::dec << std::endl;
+    logger.info(msg.str());
+    
+    // Log additional details at debug level
+    msg.str("");
+    msg << "Solution details - instruction count: " << solution.size() / 2.5 << " (approximate)";
+    logger.debug(msg.str());
 }
 
 void ConsoleProgressListener::onProgress(
@@ -369,10 +430,30 @@ void ConsoleProgressListener::onProgress(
     size_t valid_sequences_found, 
     size_t cache_size) {
     
-    std::cout << "Progress update:" << std::endl;
-    std::cout << "  Sequences tested: " << sequences_tested << std::endl;
-    std::cout << "  Valid sequences found: " << valid_sequences_found << std::endl;
-    std::cout << "  Cache size: " << cache_size << std::endl;
+    Logger& logger = getLogger();
+    
+    std::ostringstream msg;
+    msg << "Progress update:";
+    logger.info(msg.str());
+    
+    msg.str("");
+    msg << "  Sequences tested: " << sequences_tested;
+    logger.info(msg.str());
+    
+    msg.str("");
+    msg << "  Valid sequences found: " << valid_sequences_found;
+    logger.info(msg.str());
+    
+    msg.str("");
+    msg << "  Cache size: " << cache_size;
+    logger.info(msg.str());
+    
+    // Additional statistics at debug level
+    if (sequences_tested > 0) {
+        msg.str("");
+        msg << "  Success rate: " << (static_cast<double>(valid_sequences_found) / sequences_tested * 100.0) << "%";
+        logger.debug(msg.str());
+    }
 }
 
 // Explicit instantiation

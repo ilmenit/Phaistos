@@ -1,646 +1,1046 @@
 /**
  * @file parser.cpp
- * @brief Implementation of the PhaistosParser
+ * @brief Implementation of the Phaistos parser
  */
 #include "parser.hpp"
+#include "value.hpp"
+#include "logger.hpp"
+#include <fstream>
 #include <sstream>
-#include <regex>
+#include <algorithm>
+#include <cctype>
 
 namespace phaistos {
 
+//----------------------------------------------------------
+// Lexer static constants
+//----------------------------------------------------------
 template<typename AddressT>
-OptimizationSpec<AddressT> PhaistosParser<AddressT>::parse(const std::string& filename) {
-    OptimizationSpec<AddressT> spec;
+const std::unordered_set<std::string> PhaistosParser<AddressT>::Lexer::directives = {
+    "OPTIMIZE_FOR", "CPU_IN", "FLAGS_IN", "MEMORY_IN", 
+    "CPU_OUT", "FLAGS_OUT", "MEMORY_OUT", "RUN",
+    "OPTIMIZE", "OPTIMIZE_RO"
+};
+
+template<typename AddressT>
+const std::unordered_set<std::string> PhaistosParser<AddressT>::Lexer::registers = {
+    "A", "X", "Y", "SP", "PC"
+};
+
+template<typename AddressT>
+const std::unordered_set<std::string> PhaistosParser<AddressT>::Lexer::flags = {
+    "C", "Z", "I", "D", "B", "V", "N"
+};
+
+template<typename AddressT>
+const std::unordered_set<std::string> PhaistosParser<AddressT>::Lexer::keywords = {
+    "ANY", "SAME", "END"
+};
+
+//----------------------------------------------------------
+// Token methods
+//----------------------------------------------------------
+template<typename AddressT>
+std::string PhaistosParser<AddressT>::Token::toString() const {
+    std::string typeName;
+    
+    switch (type) {
+        case TokenType::DIRECTIVE: typeName = "DIRECTIVE"; break;
+        case TokenType::REGISTER: typeName = "REGISTER"; break;
+        case TokenType::FLAG: typeName = "FLAG"; break;
+        case TokenType::ADDRESS: typeName = "ADDRESS"; break;
+        case TokenType::VALUE: typeName = "VALUE"; break;
+        case TokenType::KEYWORD: typeName = "KEYWORD"; break;
+        case TokenType::COLON: typeName = "COLON"; break;
+        case TokenType::EQUALS: typeName = "EQUALS"; break;
+        case TokenType::END_OF_LINE: typeName = "END_OF_LINE"; break;
+        case TokenType::END_OF_FILE: typeName = "END_OF_FILE"; break;
+        default: typeName = "UNKNOWN"; break;
+    }
+    
+    return typeName + "('" + value + "') at " + location.toString();
+}
+
+//----------------------------------------------------------
+// Lexer implementation
+//----------------------------------------------------------
+template<typename AddressT>
+PhaistosParser<AddressT>::Lexer::Lexer(const std::string& filename)
+    : filename(filename), currentLine(0), currentCol(0), tokenPeeked(false) {
+    
+    Logger& logger = getLogger();
+    logger.debug("Opening file for parsing: " + filename);
     
     std::ifstream file(filename);
     if (!file) {
         throw std::runtime_error("Failed to open file: " + filename);
     }
     
-    int line_number = 0;
     std::string line;
     while (std::getline(file, line)) {
-        line_number++;
+        lines.push_back(line);
+    }
+    
+    logger.debug("Read " + std::to_string(lines.size()) + " lines from file");
+    
+    // Initialize with the first line if available
+    if (!lines.empty()) {
+        currentLineText = lines[0];
+    }
+}
+
+template<typename AddressT>
+bool PhaistosParser<AddressT>::Lexer::isEOF() const {
+    return currentLine >= lines.size();
+}
+
+template<typename AddressT>
+std::string PhaistosParser<AddressT>::Lexer::getCurrentLine() const {
+    if (currentLine < lines.size()) {
+        return lines[currentLine];
+    }
+    return "";
+}
+
+template<typename AddressT>
+typename PhaistosParser<AddressT>::SourceLocation PhaistosParser<AddressT>::Lexer::getLocation() const {
+    return {filename, static_cast<int>(currentLine + 1), static_cast<int>(currentCol + 1)};
+}
+
+template<typename AddressT>
+void PhaistosParser<AddressT>::Lexer::skipWhitespace() {
+    while (currentLine < lines.size()) {
+        while (currentCol < currentLineText.size() && std::isspace(currentLineText[currentCol])) {
+            currentCol++;
+        }
         
-        // Skip comments and empty lines
-        if (line.empty() || line[0] == ';') {
+        // If we found a non-whitespace character or reached a comment, stop
+        if (currentCol < currentLineText.size() && currentLineText[currentCol] != ';') {
+            return;
+        }
+        
+        // Move to the next line
+        nextLine();
+    }
+}
+
+template<typename AddressT>
+void PhaistosParser<AddressT>::Lexer::nextLine() {
+    currentLine++;
+    currentCol = 0;
+    
+    if (currentLine < lines.size()) {
+        currentLineText = lines[currentLine];
+    } else {
+        currentLineText = "";
+    }
+}
+
+template<typename AddressT>
+typename PhaistosParser<AddressT>::Token PhaistosParser<AddressT>::Lexer::readIdentifier() {
+    SourceLocation location = getLocation();
+    std::string value;
+    
+    // Read the identifier
+    while (currentCol < currentLineText.size() && 
+           (std::isalnum(currentLineText[currentCol]) || currentLineText[currentCol] == '_')) {
+        value += currentLineText[currentCol++];
+    }
+    
+    // Determine token type
+    TokenType type;
+    
+    if (directives.find(value) != directives.end()) {
+        type = TokenType::DIRECTIVE;
+    } else if (registers.find(value) != registers.end()) {
+        type = TokenType::REGISTER;
+    } else if (flags.find(value) != flags.end()) {
+        type = TokenType::FLAG;
+    } else if (keywords.find(value) != keywords.end()) {
+        type = TokenType::KEYWORD;
+    } else {
+        type = TokenType::VALUE;
+    }
+    
+    return Token(type, value, location);
+}
+
+template<typename AddressT>
+typename PhaistosParser<AddressT>::Token PhaistosParser<AddressT>::Lexer::readNumber() {
+    SourceLocation location = getLocation();
+    std::string value;
+    bool isAddress = false;
+    
+    // Check for hex prefix
+    if (currentCol + 1 < currentLineText.size() && 
+        currentLineText[currentCol] == '0' && 
+        (currentLineText[currentCol + 1] == 'x' || currentLineText[currentCol + 1] == 'X')) {
+        value += currentLineText[currentCol++]; // '0'
+        value += currentLineText[currentCol++]; // 'x'
+        isAddress = true;
+    }
+    // Check for $ prefix (alternative hex notation)
+    else if (currentCol < currentLineText.size() && currentLineText[currentCol] == '$') {
+        value += currentLineText[currentCol++];
+        isAddress = true;
+    }
+    // Check for % prefix (binary)
+    else if (currentCol < currentLineText.size() && currentLineText[currentCol] == '%') {
+        value += currentLineText[currentCol++];
+        isAddress = true;
+    }
+    
+    // Read the remaining digits
+    while (currentCol < currentLineText.size() && 
+           (std::isxdigit(currentLineText[currentCol]) || 
+            currentLineText[currentCol] == '?' || 
+            currentLineText[currentCol] == 'h')) {  // 'h' suffix for hex
+        value += currentLineText[currentCol++];
+        
+        // Handle the case where 'h' is used as a suffix for hex
+        if (currentLineText[currentCol - 1] == 'h') {
+            isAddress = true;
+            break;
+        }
+    }
+    
+    // Special processing for ? (ANY) values
+    if (value.find('?') != std::string::npos) {
+        return Token(TokenType::KEYWORD, "ANY", location);
+    }
+    
+    // Determine if this is an address or a regular value
+    // All-hex values longer than 2 chars are likely addresses
+    bool allHex = std::all_of(value.begin(), value.end(), [](char c) { 
+        return std::isxdigit(c) || c == '0' || c == 'x' || c == 'X' || c == '$' || c == '%' || c == 'h';
+    });
+    
+    if (isAddress || (allHex && value.length() > 2)) {
+        return Token(TokenType::ADDRESS, value, location);
+    } else {
+        return Token(TokenType::VALUE, value, location);
+    }
+}
+
+template<typename AddressT>
+typename PhaistosParser<AddressT>::Token PhaistosParser<AddressT>::Lexer::nextToken() {
+    Logger& logger = getLogger();
+    
+    // If we've already peeked at a token, return it
+    if (tokenPeeked) {
+        tokenPeeked = false;
+        return currentToken;
+    }
+    
+    // Skip any whitespace
+    skipWhitespace();
+    
+    // Check for end of file
+    if (currentLine >= lines.size()) {
+        return Token(TokenType::END_OF_FILE, "", getLocation());
+    }
+    
+    // Check for end of line
+    if (currentCol >= currentLineText.size() || currentLineText[currentCol] == ';') {
+        SourceLocation loc = getLocation();
+        nextLine();
+        return Token(TokenType::END_OF_LINE, "", loc);
+    }
+    
+    // Process the current character
+    char c = currentLineText[currentCol];
+    
+    // Check for special characters
+    if (c == ':') {
+        currentCol++;
+        return Token(TokenType::COLON, ":", getLocation());
+    } else if (c == '=') {
+        currentCol++;
+        return Token(TokenType::EQUALS, "=", getLocation());
+    }
+    // Check for numbers and addresses
+    else if (std::isdigit(c) || c == '$' || c == '%') {
+        return readNumber();
+    }
+    // Otherwise it's an identifier
+    else if (std::isalpha(c) || c == '_') {
+        return readIdentifier();
+    }
+    // Unknown character
+    else {
+        logger.warning("Unknown character in input: '" + std::string(1, c) + 
+                      "' at " + getLocation().toString());
+        currentCol++; // Skip the unknown character
+        return nextToken(); // Get the next valid token
+    }
+}
+
+template<typename AddressT>
+typename PhaistosParser<AddressT>::Token PhaistosParser<AddressT>::Lexer::peekToken() {
+    if (!tokenPeeked) {
+        currentToken = nextToken();
+        tokenPeeked = true;
+    }
+    return currentToken;
+}
+
+//----------------------------------------------------------
+// Parser implementation
+//----------------------------------------------------------
+template<typename AddressT>
+OptimizationSpec<AddressT> PhaistosParser<AddressT>::parse(const std::string& filename) {
+    Logger& logger = getLogger();
+    logger.info("Parsing specification file: " + filename);
+    
+    try {
+        Lexer lexer(filename);
+        OptimizationSpec<AddressT> spec = parseSpecification(lexer);
+        logger.info("Successfully parsed specification file");
+        return spec;
+    }
+    catch (const std::exception& e) {
+        logger.error("Error parsing specification: " + std::string(e.what()));
+        throw;
+    }
+}
+
+template<typename AddressT>
+OptimizationSpec<AddressT> PhaistosParser<AddressT>::parseSpecification(Lexer& lexer) {
+    Logger& logger = getLogger();
+    OptimizationSpec<AddressT> spec;
+    
+    // Process each directive in the file
+    while (!lexer.isEOF()) {
+        Token token = lexer.nextToken();
+        
+        // Skip end of line tokens
+        if (token.type == TokenType::END_OF_LINE) {
             continue;
         }
         
-        // Tokenize line
-        std::vector<Token> tokens = tokenize(line, line_number);
-        if (tokens.empty()) {
-            continue;
+        // Check for end of file
+        if (token.type == TokenType::END_OF_FILE) {
+            break;
         }
         
-        // Parse directives
-        if (tokens[0].type == TokenType::DIRECTIVE) {
-            if (tokens[0].value == "OPTIMIZE_FOR") {
-                parseOptimizationGoal(tokens, spec);
-            } else if (tokens[0].value == "CPU_IN") {
-                parseCPUState(file, spec.input_cpu);
-            } else if (tokens[0].value == "FLAGS_IN") {
-                parseFlagState(file, spec.input_flags);
-            } else if (tokens[0].value == "MEMORY_IN") {
-                parseMemoryRegions(file, spec.input_memory);
-            } else if (tokens[0].value == "CPU_OUT") {
-                parseCPUState(file, spec.output_cpu);
-            } else if (tokens[0].value == "FLAGS_OUT") {
-                parseFlagState(file, spec.output_flags);
-            } else if (tokens[0].value == "MEMORY_OUT") {
-                parseMemoryRegions(file, spec.output_memory);
-            } else if (tokens[0].value == "RUN") {
-                parseRunAddress(tokens, spec);
-            } else if (tokens[0].value == "OPTIMIZE") {
-                parseOptimizeBlock(file, spec, false);
-            } else if (tokens[0].value == "OPTIMIZE_RO") {
-                parseOptimizeBlock(file, spec, true);
-            } else {
-                throw std::runtime_error("Unknown directive: " + tokens[0].value + 
-                                         " at line " + std::to_string(line_number));
+        // Process directives
+        if (token.type == TokenType::DIRECTIVE) {
+            std::string directive = token.value;
+            logger.debug("Processing directive: " + directive);
+            
+            if (directive == "OPTIMIZE_FOR") {
+                parseOptimizationGoal(lexer, spec);
+            }
+            else if (directive == "CPU_IN") {
+                parseCPUState(lexer, spec.input_cpu);
+            }
+            else if (directive == "FLAGS_IN") {
+                parseFlagState(lexer, spec.input_flags);
+            }
+            else if (directive == "MEMORY_IN") {
+                parseMemoryRegions(lexer, spec.input_memory);
+            }
+            else if (directive == "CPU_OUT") {
+                parseCPUState(lexer, spec.output_cpu);
+            }
+            else if (directive == "FLAGS_OUT") {
+                parseFlagState(lexer, spec.output_flags);
+            }
+            else if (directive == "MEMORY_OUT") {
+                parseMemoryRegions(lexer, spec.output_memory);
+            }
+            else if (directive == "OPTIMIZE") {
+                parseOptimizeBlock(lexer, spec, false);
+            }
+            else if (directive == "OPTIMIZE_RO") {
+                parseOptimizeBlock(lexer, spec, true);
+            }
+            else if (directive == "RUN") {
+                parseRunAddress(lexer, spec);
+            }
+            else {
+                throw std::runtime_error(formatError("Unknown directive", token));
             }
         }
+        else {
+            throw std::runtime_error(formatError("Expected directive, got", token));
+        }
+    }
+    
+    // Validate the specification
+    if (spec.run_address == 0) {
+        logger.warning("No RUN address specified in the specification");
     }
     
     return spec;
 }
 
 template<typename AddressT>
-std::vector<typename PhaistosParser<AddressT>::Token> PhaistosParser<AddressT>::tokenize(
-    const std::string& line, int line_number) {
+void PhaistosParser<AddressT>::parseOptimizationGoal(Lexer& lexer, OptimizationSpec<AddressT>& spec) {
+    Logger& logger = getLogger();
     
-    std::vector<Token> tokens;
-    std::string current_token;
-    TokenType current_type = TokenType::DIRECTIVE;
-    int column = 0;
-    
-    // Handle common directives
-    static const std::unordered_set<std::string> directives = {
-        "OPTIMIZE_FOR", "CPU_IN", "FLAGS_IN", "MEMORY_IN", 
-        "CPU_OUT", "FLAGS_OUT", "MEMORY_OUT", "RUN",
-        "OPTIMIZE", "OPTIMIZE_RO", "END"
-    };
-    
-    static const std::unordered_set<std::string> registers = {
-        "A", "X", "Y", "SP", "PC"
-    };
-    
-    static const std::unordered_set<std::string> flags = {
-        "C", "Z", "I", "D", "B", "V", "N"
-    };
-    
-    for (size_t i = 0; i < line.size(); i++) {
-        char c = line[i];
-        column = i + 1;
-        
-        // Skip comments
-        if (c == ';') {
-            break;
-        }
-        
-        // Handle special characters
-        if (c == ':') {
-            if (!current_token.empty()) {
-                // Check if it's an address
-                if (current_token.find("0x") == 0 || 
-                    current_token.find("$") == 0 ||
-                    std::all_of(current_token.begin(), current_token.end(), ::isxdigit)) {
-                    tokens.emplace_back(TokenType::ADDRESS, current_token, line_number, column - current_token.size());
-                } else if (directives.find(current_token) != directives.end()) {
-                    tokens.emplace_back(TokenType::DIRECTIVE, current_token, line_number, column - current_token.size());
-                } else if (registers.find(current_token) != registers.end()) {
-                    tokens.emplace_back(TokenType::REGISTER, current_token, line_number, column - current_token.size());
-                } else if (flags.find(current_token) != flags.end()) {
-                    tokens.emplace_back(TokenType::FLAG, current_token, line_number, column - current_token.size());
-                } else {
-                    tokens.emplace_back(TokenType::VALUE, current_token, line_number, column - current_token.size());
-                }
-                current_token.clear();
-            }
-            tokens.emplace_back(TokenType::COLON, ":", line_number, column);
-            continue;
-        }
-        
-        if (c == '=') {
-            if (!current_token.empty()) {
-                if (registers.find(current_token) != registers.end()) {
-                    tokens.emplace_back(TokenType::REGISTER, current_token, line_number, column - current_token.size());
-                } else if (flags.find(current_token) != flags.end()) {
-                    tokens.emplace_back(TokenType::FLAG, current_token, line_number, column - current_token.size());
-                } else {
-                    tokens.emplace_back(TokenType::VALUE, current_token, line_number, column - current_token.size());
-                }
-                current_token.clear();
-            }
-            tokens.emplace_back(TokenType::EQUALS, "=", line_number, column);
-            continue;
-        }
-        
-        // Handle whitespace
-        if (std::isspace(c)) {
-            if (!current_token.empty()) {
-                if (current_token == "END") {
-                    tokens.emplace_back(TokenType::END, current_token, line_number, column - current_token.size());
-                } else if (current_token == "??") {
-                    tokens.emplace_back(TokenType::ANY, current_token, line_number, column - current_token.size());
-                } else if (current_token == "?" || current_token == "ANY") {
-                    tokens.emplace_back(TokenType::ANY, current_token, line_number, column - current_token.size());
-                } else if (current_token == "SAME") {
-                    tokens.emplace_back(TokenType::SAME, current_token, line_number, column - current_token.size());
-                } else if (directives.find(current_token) != directives.end()) {
-                    tokens.emplace_back(TokenType::DIRECTIVE, current_token, line_number, column - current_token.size());
-                } else if (registers.find(current_token) != registers.end()) {
-                    tokens.emplace_back(TokenType::REGISTER, current_token, line_number, column - current_token.size());
-                } else if (flags.find(current_token) != flags.end()) {
-                    tokens.emplace_back(TokenType::FLAG, current_token, line_number, column - current_token.size());
-                } else {
-                    tokens.emplace_back(TokenType::VALUE, current_token, line_number, column - current_token.size());
-                }
-                current_token.clear();
-            }
-            continue;
-        }
-        
-        // Accumulate token
-        current_token += c;
+    // Expect a colon
+    Token token = lexer.nextToken();
+    if (token.type != TokenType::COLON) {
+        throw std::runtime_error(formatError("Expected ':', got", token));
     }
     
-    // Handle last token
-    if (!current_token.empty()) {
-        if (current_token == "END") {
-            tokens.emplace_back(TokenType::END, current_token, line_number, column - current_token.size());
-        } else if (current_token == "??") {
-            tokens.emplace_back(TokenType::ANY, current_token, line_number, column - current_token.size());
-        } else if (current_token == "?" || current_token == "ANY") {
-            tokens.emplace_back(TokenType::ANY, current_token, line_number, column - current_token.size());
-        } else if (current_token == "SAME") {
-            tokens.emplace_back(TokenType::SAME, current_token, line_number, column - current_token.size());
-        } else if (directives.find(current_token) != directives.end()) {
-            tokens.emplace_back(TokenType::DIRECTIVE, current_token, line_number, column - current_token.size());
-        } else if (registers.find(current_token) != registers.end()) {
-            tokens.emplace_back(TokenType::REGISTER, current_token, line_number, column - current_token.size());
-        } else if (flags.find(current_token) != flags.end()) {
-            tokens.emplace_back(TokenType::FLAG, current_token, line_number, column - current_token.size());
-        } else {
-            tokens.emplace_back(TokenType::VALUE, current_token, line_number, column - current_token.size());
-        }
+    // Get the goal
+    token = lexer.nextToken();
+    if (token.type != TokenType::VALUE) {
+        throw std::runtime_error(formatError("Expected goal (size or speed), got", token));
     }
     
-    return tokens;
-}
-
-template<typename AddressT>
-void PhaistosParser<AddressT>::parseOptimizationGoal(
-    const std::vector<Token>& tokens, 
-    OptimizationSpec<AddressT>& spec) {
-    
-    if (tokens.size() < 3) {
-        throw std::runtime_error("Invalid OPTIMIZE_FOR directive, expected OPTIMIZE_FOR: goal");
-    }
-    
-    if (tokens[1].type != TokenType::COLON) {
-        throw std::runtime_error("Expected ':' after OPTIMIZE_FOR");
-    }
-    
-    std::string goal = tokens[2].value;
+    std::string goal = token.value;
     std::transform(goal.begin(), goal.end(), goal.begin(), ::tolower);
     
     if (goal == "size") {
         spec.goal = OptimizationSpec<AddressT>::SIZE;
-    } else if (goal == "speed") {
+        logger.debug("Setting optimization goal to SIZE");
+    }
+    else if (goal == "speed") {
         spec.goal = OptimizationSpec<AddressT>::SPEED;
-    } else {
-        throw std::runtime_error("Invalid optimization goal: " + goal + ", expected 'size' or 'speed'");
+        logger.debug("Setting optimization goal to SPEED");
+    }
+    else {
+        throw std::runtime_error(formatError("Invalid optimization goal, expected 'size' or 'speed', got", token));
+    }
+    
+    // Skip to the end of the line
+    while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+        token = lexer.nextToken();
     }
 }
 
 template<typename AddressT>
-void PhaistosParser<AddressT>::parseCPUState(
-    std::istream& input, 
-    typename OptimizationSpec<AddressT>::CPUState& state) {
+void PhaistosParser<AddressT>::parseCPUState(Lexer& lexer, typename OptimizationSpec<AddressT>::CPUState& state) {
+    Logger& logger = getLogger();
+    logger.debug("Parsing CPU state");
     
-    std::string line;
-    
-    while (std::getline(input, line)) {
-        // Skip comments and empty lines
-        if (line.empty() || line[0] == ';') {
+    // Process each register assignment
+    Token token = lexer.nextToken();
+    while (token.type != TokenType::DIRECTIVE && token.type != TokenType::END_OF_FILE) {
+        // Skip end of line tokens
+        if (token.type == TokenType::END_OF_LINE) {
+            token = lexer.nextToken();
             continue;
         }
         
-        // Check for end of section
-        if (line.find("CPU_") == 0 || 
-            line.find("FLAGS_") == 0 || 
-            line.find("MEMORY_") == 0 ||
-            line.find("OPTIMIZE") == 0 ||
-            line.find("RUN") == 0) {
-            // Push back the line for the next directive
-            input.seekg(-static_cast<int>(line.size()) - 1, std::ios_base::cur);
-            break;
+        // Expect a register
+        if (token.type != TokenType::REGISTER) {
+            throw std::runtime_error(formatError("Expected register name, got", token));
         }
         
-        // Parse register assignments
-        std::vector<Token> tokens = tokenize(line, 0);
-        if (tokens.empty()) {
-            continue;
+        std::string reg = token.value;
+        
+        // Expect a colon or equals sign
+        token = lexer.nextToken();
+        if (token.type != TokenType::COLON && token.type != TokenType::EQUALS) {
+            throw std::runtime_error(formatError("Expected ':' or '=' after register name, got", token));
         }
         
-        if (tokens.size() < 3) {
-            throw std::runtime_error("Invalid CPU register assignment: " + line);
-        }
-        
-        if (tokens[0].type != TokenType::REGISTER) {
-            throw std::runtime_error("Expected register name, got: " + tokens[0].value);
-        }
-        
-        if (tokens[1].type != TokenType::COLON && tokens[1].type != TokenType::EQUALS) {
-            throw std::runtime_error("Expected ':' or '=' after register, got: " + tokens[1].value);
-        }
-        
-        std::string reg = tokens[0].value;
+        // Get the value
+        token = lexer.nextToken();
         Value value;
         
-        if (tokens[2].type == TokenType::ANY) {
+        if (token.type == TokenType::KEYWORD && token.value == "ANY") {
             value = Value::any();
-        } else if (tokens[2].type == TokenType::SAME) {
+            logger.debug("Register " + reg + " value: ANY");
+        }
+        else if (token.type == TokenType::KEYWORD && token.value == "SAME") {
             value = Value::same();
-        } else {
-            value = Value::parse(tokens[2].value);
+            logger.debug("Register " + reg + " value: SAME");
+        }
+        else if (token.type == TokenType::VALUE || token.type == TokenType::ADDRESS) {
+            value = parseValue(token);
+            logger.debug("Register " + reg + " value: " + token.value);
+        }
+        else {
+            throw std::runtime_error(formatError("Expected value, got", token));
         }
         
+        // Set the register value
         if (reg == "A") {
             state.a = value;
-        } else if (reg == "X") {
-            state.x = value;
-        } else if (reg == "Y") {
-            state.y = value;
-        } else if (reg == "SP") {
-            state.sp = value;
-        } else {
-            throw std::runtime_error("Unknown register: " + reg);
         }
+        else if (reg == "X") {
+            state.x = value;
+        }
+        else if (reg == "Y") {
+            state.y = value;
+        }
+        else if (reg == "SP") {
+            state.sp = value;
+        }
+        else {
+            throw std::runtime_error(formatError("Unknown register", token));
+        }
+        
+        // Skip to the end of the line
+        while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+            token = lexer.nextToken();
+        }
+        
+        // Get the next token
+        token = lexer.nextToken();
     }
+    
+    // Push back the directive token
+    if (token.type == TokenType::DIRECTIVE) {
+        lexer.peekToken(); // This will make the next call to nextToken() return the same token
+    }
+    
+    logger.debug("Finished parsing CPU state");
 }
 
 template<typename AddressT>
-void PhaistosParser<AddressT>::parseFlagState(
-    std::istream& input, 
-    typename OptimizationSpec<AddressT>::FlagState& flags) {
+void PhaistosParser<AddressT>::parseFlagState(Lexer& lexer, typename OptimizationSpec<AddressT>::FlagState& flags) {
+    Logger& logger = getLogger();
+    logger.debug("Parsing flag state");
     
-    std::string line;
-    
-    while (std::getline(input, line)) {
-        // Skip comments and empty lines
-        if (line.empty() || line[0] == ';') {
+    // Process each flag assignment
+    Token token = lexer.nextToken();
+    while (token.type != TokenType::DIRECTIVE && token.type != TokenType::END_OF_FILE) {
+        // Skip end of line tokens
+        if (token.type == TokenType::END_OF_LINE) {
+            token = lexer.nextToken();
             continue;
         }
         
-        // Check for end of section
-        if (line.find("CPU_") == 0 || 
-            line.find("FLAGS_") == 0 || 
-            line.find("MEMORY_") == 0 ||
-            line.find("OPTIMIZE") == 0 ||
-            line.find("RUN") == 0) {
-            // Push back the line for the next directive
-            input.seekg(-static_cast<int>(line.size()) - 1, std::ios_base::cur);
-            break;
+        // Expect a flag
+        if (token.type != TokenType::FLAG) {
+            throw std::runtime_error(formatError("Expected flag name, got", token));
         }
         
-        // Parse flag assignments
-        std::vector<Token> tokens = tokenize(line, 0);
-        if (tokens.empty()) {
-            continue;
+        std::string flag = token.value;
+        
+        // Expect a colon or equals sign
+        token = lexer.nextToken();
+        if (token.type != TokenType::COLON && token.type != TokenType::EQUALS) {
+            throw std::runtime_error(formatError("Expected ':' or '=' after flag name, got", token));
         }
         
-        if (tokens.size() < 3) {
-            throw std::runtime_error("Invalid CPU flag assignment: " + line);
-        }
-        
-        if (tokens[0].type != TokenType::FLAG) {
-            throw std::runtime_error("Expected flag name, got: " + tokens[0].value);
-        }
-        
-        if (tokens[1].type != TokenType::COLON && tokens[1].type != TokenType::EQUALS) {
-            throw std::runtime_error("Expected ':' or '=' after flag, got: " + tokens[1].value);
-        }
-        
-        std::string flag = tokens[0].value;
+        // Get the value
+        token = lexer.nextToken();
         Value value;
         
-        if (tokens[2].type == TokenType::ANY) {
+        if (token.type == TokenType::KEYWORD && token.value == "ANY") {
             value = Value::any();
-        } else if (tokens[2].type == TokenType::SAME) {
+            logger.debug("Flag " + flag + " value: ANY");
+        }
+        else if (token.type == TokenType::KEYWORD && token.value == "SAME") {
             value = Value::same();
-        } else {
-            value = Value::parse(tokens[2].value);
+            logger.debug("Flag " + flag + " value: SAME");
+        }
+        else if (token.type == TokenType::VALUE) {
+            value = parseValue(token);
+            logger.debug("Flag " + flag + " value: " + token.value);
+        }
+        else {
+            throw std::runtime_error(formatError("Expected value, got", token));
         }
         
+        // Set the flag value
         if (flag == "C") {
             flags.c = value;
-        } else if (flag == "Z") {
+        }
+        else if (flag == "Z") {
             flags.z = value;
-        } else if (flag == "I") {
+        }
+        else if (flag == "I") {
             flags.i = value;
-        } else if (flag == "D") {
+        }
+        else if (flag == "D") {
             flags.d = value;
-        } else if (flag == "B") {
+        }
+        else if (flag == "B") {
             flags.b = value;
-        } else if (flag == "V") {
+        }
+        else if (flag == "V") {
             flags.v = value;
-        } else if (flag == "N") {
+        }
+        else if (flag == "N") {
             flags.n = value;
-        } else {
-            throw std::runtime_error("Unknown flag: " + flag);
         }
+        else {
+            throw std::runtime_error(formatError("Unknown flag", token));
+        }
+        
+        // Skip to the end of the line
+        while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+            token = lexer.nextToken();
+        }
+        
+        // Get the next token
+        token = lexer.nextToken();
     }
+    
+    // Push back the directive token
+    if (token.type == TokenType::DIRECTIVE) {
+        lexer.peekToken(); // This will make the next call to nextToken() return the same token
+    }
+    
+    logger.debug("Finished parsing flag state");
 }
 
 template<typename AddressT>
-void PhaistosParser<AddressT>::parseMemoryRegions(
-    std::istream& input, 
-    std::vector<typename OptimizationSpec<AddressT>::MemoryRegion>& regions) {
+void PhaistosParser<AddressT>::parseMemoryRegions(Lexer& lexer, 
+                                             std::vector<typename OptimizationSpec<AddressT>::MemoryRegion>& regions) {
+    Logger& logger = getLogger();
+    logger.debug("Parsing memory regions");
     
-    std::string line;
-    
-    while (std::getline(input, line)) {
-        // Skip comments and empty lines
-        if (line.empty() || line[0] == ';') {
+    // Process each memory region
+    Token token = lexer.nextToken();
+    while (token.type != TokenType::DIRECTIVE && token.type != TokenType::END_OF_FILE) {
+        // Skip end of line tokens
+        if (token.type == TokenType::END_OF_LINE) {
+            token = lexer.nextToken();
             continue;
         }
         
-        // Check for end of section
-        if (line.find("CPU_") == 0 || 
-            line.find("FLAGS_") == 0 || 
-            line.find("MEMORY_") == 0 ||
-            line.find("OPTIMIZE") == 0 ||
-            line.find("RUN") == 0) {
-            // Push back the line for the next directive
-            input.seekg(-static_cast<int>(line.size()) - 1, std::ios_base::cur);
-            break;
+        // Expect an address
+        if (token.type != TokenType::ADDRESS) {
+            throw std::runtime_error(formatError("Expected address, got", token));
         }
         
-        // Parse memory region
-        std::vector<Token> tokens = tokenize(line, 0);
-        if (tokens.empty()) {
-            continue;
+        // Parse the address
+        AddressT address = parseAddress(token);
+        
+        // Expect a colon
+        token = lexer.nextToken();
+        if (token.type != TokenType::COLON) {
+            throw std::runtime_error(formatError("Expected ':' after address, got", token));
         }
         
-        if (tokens[0].type == TokenType::ADDRESS) {
-            if (tokens.size() < 2 || tokens[1].type != TokenType::COLON) {
-                throw std::runtime_error("Invalid memory region format, expected ADDRESS: values");
+        // Create a new memory region
+        typename OptimizationSpec<AddressT>::MemoryRegion region;
+        region.address = address;
+        
+        // Parse values on the same line (horizontal format)
+        token = lexer.nextToken();
+        while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+            // Parse the value
+            if (token.type == TokenType::VALUE || token.type == TokenType::ADDRESS) {
+                region.bytes.push_back(parseValue(token));
+                logger.debug("Added byte value: " + token.value);
+            }
+            else if (token.type == TokenType::KEYWORD && token.value == "ANY") {
+                region.bytes.push_back(Value::any());
+                logger.debug("Added ANY byte value");
+            }
+            else if (token.type == TokenType::KEYWORD && token.value == "SAME") {
+                region.bytes.push_back(Value::same());
+                logger.debug("Added SAME byte value");
+            }
+            else {
+                throw std::runtime_error(formatError("Expected value, got", token));
             }
             
-            if (tokens.size() > 2) {
-                // Horizontal format
-                auto region = parseHorizontalMemoryRegion(tokens);
-                regions.push_back(region);
-            } else {
-                // Vertical format
-                typename OptimizationSpec<AddressT>::MemoryRegion region;
-                region.address = parseAddress(tokens[0]);
+            // Get the next token
+            token = lexer.nextToken();
+        }
+        
+        // If we didn't get any values on the same line, try the next line
+        if (region.bytes.empty()) {
+            token = lexer.nextToken();
+            
+            // Parse values in vertical format
+            while (token.type != TokenType::ADDRESS && 
+                   token.type != TokenType::DIRECTIVE && 
+                   token.type != TokenType::END_OF_FILE) {
                 
-                // Parse values line by line
-                bool end_found = false;
-                while (std::getline(input, line) && !end_found) {
-                    // Skip comments and empty lines
-                    if (line.empty() || line[0] == ';') {
-                        continue;
-                    }
-                    
-                    // Parse line
-                    tokens = tokenize(line, 0);
-                    if (tokens.empty()) {
-                        continue;
-                    }
-                    
-                    // Check for next region or directive
-                    if (tokens[0].type == TokenType::ADDRESS || 
-                        tokens[0].type == TokenType::DIRECTIVE) {
-                        // Push back the line for the next region/directive
-                        input.seekg(-static_cast<int>(line.size()) - 1, std::ios_base::cur);
-                        break;
-                    }
-                    
-                    // Parse values
-                    for (const auto& token : tokens) {
-                        if (token.type == TokenType::VALUE) {
-                            region.bytes.push_back(Value::parse(token.value));
-                        } else if (token.type == TokenType::ANY) {
-                            region.bytes.push_back(Value::any());
-                        } else if (token.type == TokenType::SAME) {
-                            region.bytes.push_back(Value::same());
-                        }
-                    }
-                }
-                
-                if (!region.bytes.empty()) {
-                    regions.push_back(region);
-                }
-            }
-        } else {
-            throw std::runtime_error("Invalid memory region format, expected ADDRESS: values");
-        }
-    }
-}
-
-template<typename AddressT>
-typename OptimizationSpec<AddressT>::MemoryRegion 
-PhaistosParser<AddressT>::parseHorizontalMemoryRegion(const std::vector<Token>& tokens) {
-    typename OptimizationSpec<AddressT>::MemoryRegion region;
-    region.address = parseAddress(tokens[0]);
-    
-    for (size_t i = 2; i < tokens.size(); i++) {
-        if (tokens[i].type == TokenType::VALUE) {
-            region.bytes.push_back(Value::parse(tokens[i].value));
-        } else if (tokens[i].type == TokenType::ANY) {
-            region.bytes.push_back(Value::any());
-        } else if (tokens[i].type == TokenType::SAME) {
-            region.bytes.push_back(Value::same());
-        }
-    }
-    
-    return region;
-}
-
-template<typename AddressT>
-void PhaistosParser<AddressT>::parseRunAddress(
-    const std::vector<Token>& tokens, 
-    OptimizationSpec<AddressT>& spec) {
-    
-    if (tokens.size() < 3) {
-        throw std::runtime_error("Invalid RUN directive, expected RUN: address");
-    }
-    
-    if (tokens[1].type != TokenType::COLON) {
-        throw std::runtime_error("Expected ':' after RUN");
-    }
-    
-    if (tokens[2].type != TokenType::ADDRESS && tokens[2].type != TokenType::VALUE) {
-        throw std::runtime_error("Expected address after RUN:");
-    }
-    
-    spec.run_address = parseAddress(tokens[2]);
-}
-
-template<typename AddressT>
-void PhaistosParser<AddressT>::parseOptimizeBlock(
-    std::istream& input, 
-    OptimizationSpec<AddressT>& spec,
-    bool read_only) {
-    
-    std::string line;
-    
-    while (std::getline(input, line)) {
-        // Skip comments and empty lines
-        if (line.empty() || line[0] == ';') {
-            continue;
-        }
-        
-        // Parse line
-        std::vector<Token> tokens = tokenize(line, 0);
-        if (tokens.empty()) {
-            continue;
-        }
-        
-        // Check for end of section
-        if (tokens[0].type == TokenType::DIRECTIVE && 
-            (tokens[0].value == "CPU_IN" || 
-             tokens[0].value == "FLAGS_IN" || 
-             tokens[0].value == "MEMORY_IN" || 
-             tokens[0].value == "CPU_OUT" || 
-             tokens[0].value == "FLAGS_OUT" || 
-             tokens[0].value == "MEMORY_OUT" ||
-             tokens[0].value == "OPTIMIZE" ||
-             tokens[0].value == "OPTIMIZE_RO" ||
-             tokens[0].value == "RUN")) {
-            // Push back the line for the next directive
-            input.seekg(-static_cast<int>(line.size()) - 1, std::ios_base::cur);
-            break;
-        }
-        
-        // Handle address
-        if (tokens[0].type == TokenType::ADDRESS) {
-            if (tokens.size() < 2 || tokens[1].type != TokenType::COLON) {
-                throw std::runtime_error("Invalid OPTIMIZE block format, expected ADDRESS: values");
-            }
-            
-            typename OptimizationSpec<AddressT>::CodeBlock block;
-            block.address = parseAddress(tokens[0]);
-            block.type = read_only ? 
-                        OptimizationSpec<AddressT>::CodeBlock::READ_ONLY : 
-                        OptimizationSpec<AddressT>::CodeBlock::REGULAR;
-            
-            // Check if we have an empty block for code synthesis
-            if (tokens.size() > 2 && tokens[2].type == TokenType::END) {
-                // Empty block for code synthesis
-                spec.code_blocks.push_back(block);
-                continue;
-            }
-            
-            // Parse block contents
-            bool end_found = false;
-            while (std::getline(input, line) && !end_found) {
-                // Skip comments and empty lines
-                if (line.empty() || line[0] == ';') {
+                // Skip end of line tokens
+                if (token.type == TokenType::END_OF_LINE) {
+                    token = lexer.nextToken();
                     continue;
                 }
                 
-                // Parse line
-                tokens = tokenize(line, 0);
-                if (tokens.empty()) {
+                // Parse the value
+                if (token.type == TokenType::VALUE || token.type == TokenType::ADDRESS) {
+                    region.bytes.push_back(parseValue(token));
+                    logger.debug("Added byte value: " + token.value);
+                }
+                else if (token.type == TokenType::KEYWORD && token.value == "ANY") {
+                    region.bytes.push_back(Value::any());
+                    logger.debug("Added ANY byte value");
+                }
+                else if (token.type == TokenType::KEYWORD && token.value == "SAME") {
+                    region.bytes.push_back(Value::same());
+                    logger.debug("Added SAME byte value");
+                }
+                else {
+                    throw std::runtime_error(formatError("Expected value, got", token));
+                }
+                
+                // Skip to the end of the line
+                while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+                    token = lexer.nextToken();
+                }
+                
+                // Get the next token
+                token = lexer.nextToken();
+            }
+        }
+        
+        // Add the region to the list
+        if (!region.bytes.empty()) {
+            regions.push_back(region);
+            logger.debug("Added memory region at address 0x" + 
+                         std::to_string(region.address) + 
+                         " with " + std::to_string(region.bytes.size()) + " bytes");
+        }
+        
+        // Continue with the next region
+        if (token.type == TokenType::ADDRESS) {
+            // Keep the token for the next region
+            lexer.peekToken();
+        }
+        else if (token.type == TokenType::DIRECTIVE) {
+            // Keep the directive token
+            lexer.peekToken();
+            break;
+        }
+    }
+    
+    logger.debug("Finished parsing memory regions, found " + std::to_string(regions.size()) + " regions");
+}
+
+template<typename AddressT>
+void PhaistosParser<AddressT>::parseOptimizeBlock(Lexer& lexer, OptimizationSpec<AddressT>& spec, bool readOnly) {
+    Logger& logger = getLogger();
+    logger.debug("Parsing " + std::string(readOnly ? "OPTIMIZE_RO" : "OPTIMIZE") + " block");
+    
+    // Process each code block
+    Token token = lexer.nextToken();
+    while (token.type != TokenType::DIRECTIVE && token.type != TokenType::END_OF_FILE) {
+        // Skip end of line tokens
+        if (token.type == TokenType::END_OF_LINE) {
+            token = lexer.nextToken();
+            continue;
+        }
+        
+        // Expect an address
+        if (token.type != TokenType::ADDRESS) {
+            throw std::runtime_error(formatError("Expected address, got", token));
+        }
+        
+        // Parse the address
+        AddressT address = parseAddress(token);
+        
+        // Expect a colon
+        token = lexer.nextToken();
+        if (token.type != TokenType::COLON) {
+            throw std::runtime_error(formatError("Expected ':' after address, got", token));
+        }
+        
+        // Create a new code block
+        typename OptimizationSpec<AddressT>::CodeBlock block;
+        block.address = address;
+        block.type = readOnly ? 
+                    OptimizationSpec<AddressT>::CodeBlock::READ_ONLY : 
+                    OptimizationSpec<AddressT>::CodeBlock::REGULAR;
+        
+        // Check for empty block (END marker on the same line)
+        token = lexer.nextToken();
+        if (token.type == TokenType::KEYWORD && token.value == "END") {
+            // Empty block for code synthesis
+            logger.debug("Found empty code block for synthesis at address 0x" + std::to_string(address));
+            spec.code_blocks.push_back(block);
+            
+            // Skip to the end of the line
+            while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+                token = lexer.nextToken();
+            }
+            
+            // Get the next token
+            token = lexer.nextToken();
+            continue;
+        }
+        
+        // Parse the block contents
+        bool endFound = false;
+        
+        // First handle values on the same line
+        while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+            if (token.type == TokenType::KEYWORD && token.value == "END") {
+                endFound = true;
+                break;
+            }
+            
+            // Skip ANY values
+            if (token.type == TokenType::KEYWORD && token.value == "ANY") {
+                logger.debug("Skipping ANY value in code block");
+            }
+            else if (token.type == TokenType::VALUE || token.type == TokenType::ADDRESS) {
+                try {
+                    uint8_t byte = parseByte(token);
+                    block.bytes.push_back(byte);
+                    logger.debug("Added byte 0x" + std::to_string(static_cast<int>(byte)) + " to code block");
+                }
+                catch (const std::exception& e) {
+                    logger.warning("Failed to parse byte value: " + token.value + 
+                                 " at " + token.location.toString() + ": " + e.what());
+                }
+            }
+            
+            token = lexer.nextToken();
+        }
+        
+        // Then parse values on subsequent lines
+        if (!endFound) {
+            token = lexer.nextToken();
+            
+            while (token.type != TokenType::DIRECTIVE && 
+                   token.type != TokenType::END_OF_FILE && 
+                   !(token.type == TokenType::ADDRESS && lexer.peekToken().type == TokenType::COLON)) {
+                
+                // Skip end of line tokens
+                if (token.type == TokenType::END_OF_LINE) {
+                    token = lexer.nextToken();
                     continue;
                 }
                 
                 // Check for END marker
-                if (tokens[0].type == TokenType::END) {
-                    end_found = true;
+                if (token.type == TokenType::KEYWORD && token.value == "END") {
+                    endFound = true;
+                    
+                    // Skip to the end of the line
+                    while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+                        token = lexer.nextToken();
+                    }
+                    
                     break;
                 }
                 
-                // Check for next block or directive
-                if (tokens[0].type == TokenType::ADDRESS || 
-                    tokens[0].type == TokenType::DIRECTIVE) {
-                    // Push back the line for the next block/directive
-                    input.seekg(-static_cast<int>(line.size()) - 1, std::ios_base::cur);
-                    break;
+                // Skip ANY values
+                if (token.type == TokenType::KEYWORD && token.value == "ANY") {
+                    logger.debug("Skipping ANY value in code block");
                 }
-                
-                // Parse bytes
-                for (const auto& token : tokens) {
-                    if (token.type == TokenType::VALUE) {
-                        try {
-                            uint8_t value = std::stoi(token.value, nullptr, 0);
-                            block.bytes.push_back(value);
-                        } catch (const std::exception& e) {
-                            throw std::runtime_error("Invalid byte value: " + token.value);
-                        }
+                else if (token.type == TokenType::VALUE || token.type == TokenType::ADDRESS) {
+                    try {
+                        uint8_t byte = parseByte(token);
+                        block.bytes.push_back(byte);
+                        logger.debug("Added byte 0x" + std::to_string(static_cast<int>(byte)) + " to code block");
+                    }
+                    catch (const std::exception& e) {
+                        logger.warning("Failed to parse byte value: " + token.value + 
+                                     " at " + token.location.toString() + ": " + e.what());
                     }
                 }
+                
+                // Skip to the end of the line
+                while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+                    token = lexer.nextToken();
+                }
+                
+                // Get the next token
+                token = lexer.nextToken();
             }
-            
-            spec.code_blocks.push_back(block);
         }
+        
+        // Add the block to the list
+        spec.code_blocks.push_back(block);
+        logger.debug("Added code block at address 0x" + 
+                   std::to_string(block.address) + 
+                   " with " + std::to_string(block.bytes.size()) + " bytes");
+        
+        // Continue with the next block
+        if (token.type == TokenType::ADDRESS) {
+            // Keep the token for the next block
+            lexer.peekToken();
+        }
+        else if (token.type == TokenType::DIRECTIVE) {
+            // Keep the directive token
+            lexer.peekToken();
+            break;
+        }
+    }
+    
+    logger.debug("Finished parsing " + std::string(readOnly ? "OPTIMIZE_RO" : "OPTIMIZE") + 
+               " block, total blocks: " + std::to_string(spec.code_blocks.size()));
+}
+
+template<typename AddressT>
+void PhaistosParser<AddressT>::parseRunAddress(Lexer& lexer, OptimizationSpec<AddressT>& spec) {
+    Logger& logger = getLogger();
+    
+    // Expect a colon
+    Token token = lexer.nextToken();
+    if (token.type != TokenType::COLON) {
+        throw std::runtime_error(formatError("Expected ':' after RUN, got", token));
+    }
+    
+    // Get the address
+    token = lexer.nextToken();
+    if (token.type != TokenType::ADDRESS && token.type != TokenType::VALUE) {
+        throw std::runtime_error(formatError("Expected address after RUN:, got", token));
+    }
+    
+    // Parse the address
+    spec.run_address = parseAddress(token);
+    logger.debug("Set run address to 0x" + std::to_string(spec.run_address));
+    
+    // Skip to the end of the line
+    while (token.type != TokenType::END_OF_LINE && token.type != TokenType::END_OF_FILE) {
+        token = lexer.nextToken();
     }
 }
 
 template<typename AddressT>
 AddressT PhaistosParser<AddressT>::parseAddress(const Token& token) {
+    Logger& logger = getLogger();
     std::string text = token.value;
     
-    // Hexadecimal (0xNNNN, $NNNN, NNNNh)
-    if ((text.size() >= 3 && text.substr(0, 2) == "0x") ||
-        (text.size() >= 2 && text[0] == '$') ||
-        (text.size() >= 2 && text.back() == 'h')) {
-        
-        std::string hexPart;
-        if (text.substr(0, 2) == "0x") {
-            hexPart = text.substr(2);
-        } else if (text[0] == '$') {
-            hexPart = text.substr(1);
-        } else if (text.back() == 'h') {
-            hexPart = text.substr(0, text.size() - 1);
+    try {
+        // Hexadecimal (0xNNNN)
+        if (text.find("0x") == 0 || text.find("0X") == 0) {
+            AddressT result = static_cast<AddressT>(std::stoi(text.substr(2), nullptr, 16));
+            logger.debug("Parsed hexadecimal address: 0x" + std::to_string(result));
+            return result;
         }
-        
-        return static_cast<AddressT>(std::stoi(hexPart, nullptr, 16));
-    }
-    
-    // Binary (0bNNNNNNNN or %NNNNNNNN)
-    if ((text.size() >= 3 && text.substr(0, 2) == "0b") ||
-        (text.size() >= 2 && text[0] == '%')) {
-        
-        std::string binPart;
-        if (text.substr(0, 2) == "0b") {
-            binPart = text.substr(2);
-        } else if (text[0] == '%') {
-            binPart = text.substr(1);
+        // Hexadecimal ($NNNN)
+        else if (text.find("$") == 0) {
+            AddressT result = static_cast<AddressT>(std::stoi(text.substr(1), nullptr, 16));
+            logger.debug("Parsed hexadecimal address: 0x" + std::to_string(result));
+            return result;
         }
-        
-        return static_cast<AddressT>(std::stoi(binPart, nullptr, 2));
+        // Hexadecimal (NNNNh)
+        else if (text.size() >= 2 && text.back() == 'h') {
+            AddressT result = static_cast<AddressT>(std::stoi(text.substr(0, text.size() - 1), nullptr, 16));
+            logger.debug("Parsed hexadecimal address: 0x" + std::to_string(result));
+            return result;
+        }
+        // Binary (0bNNNNNNNN)
+        else if (text.find("0b") == 0 || text.find("0B") == 0) {
+            AddressT result = static_cast<AddressT>(std::stoi(text.substr(2), nullptr, 2));
+            logger.debug("Parsed binary address: 0x" + std::to_string(result));
+            return result;
+        }
+        // Binary (%NNNNNNNN)
+        else if (text.find("%") == 0) {
+            AddressT result = static_cast<AddressT>(std::stoi(text.substr(1), nullptr, 2));
+            logger.debug("Parsed binary address: 0x" + std::to_string(result));
+            return result;
+        }
+        // Try as hex if all hex digits
+        else if (std::all_of(text.begin(), text.end(), [](char c) { 
+            return std::isxdigit(c); 
+        })) {
+            AddressT result = static_cast<AddressT>(std::stoi(text, nullptr, 16));
+            logger.debug("Parsed implicit hexadecimal address: 0x" + std::to_string(result));
+            return result;
+        }
+        // Decimal
+        else {
+            AddressT result = static_cast<AddressT>(std::stoi(text));
+            logger.debug("Parsed decimal address: 0x" + std::to_string(result));
+            return result;
+        }
     }
-    
-    // Decimal
-    return static_cast<AddressT>(std::stoi(text));
+    catch (const std::exception& e) {
+        throw std::runtime_error(formatError("Failed to parse address: " + std::string(e.what()), token));
+    }
 }
 
 template<typename AddressT>
 Value PhaistosParser<AddressT>::parseValue(const Token& token) {
-    if (token.type == TokenType::ANY) {
-        return Value::any();
-    } else if (token.type == TokenType::SAME) {
-        return Value::same();
-    } else {
-        return Value::parse(token.value);
+    Logger& logger = getLogger();
+    
+    try {
+        // Check for special values
+        if (token.type == TokenType::KEYWORD) {
+            if (token.value == "ANY") {
+                logger.debug("Parsed ANY value");
+                return Value::any();
+            }
+            else if (token.value == "SAME") {
+                logger.debug("Parsed SAME value");
+                return Value::same();
+            }
+        }
+        
+        // Otherwise parse as a regular value
+        Value result = Value::parse(token.value);
+        
+        if (result.type == Value::EXACT) {
+            logger.debug("Parsed EXACT value: 0x" + std::to_string(static_cast<int>(result.exact_value)));
+        }
+        else {
+            logger.debug("Parsed non-EXACT value");
+        }
+        
+        return result;
+    }
+    catch (const std::exception& e) {
+        throw std::runtime_error(formatError("Failed to parse value: " + std::string(e.what()), token));
     }
 }
 
 template<typename AddressT>
-void PhaistosParser<AddressT>::skipCommentsAndEmptyLines(std::istream& input) {
-    std::string line;
-    while (input.peek() == ';' || input.peek() == '\n' || input.peek() == '\r') {
-        std::getline(input, line);
+uint8_t PhaistosParser<AddressT>::parseByte(const Token& token) {
+    Logger& logger = getLogger();
+    std::string text = token.value;
+    
+    try {
+        // If the value contains a '?', it's an ANY value, which we skip
+        if (text.find('?') != std::string::npos) {
+            throw std::runtime_error("ANY values are not allowed in code blocks");
+        }
+        
+        int value = 0;
+        
+        // Hexadecimal (0xNN)
+        if (text.find("0x") == 0 || text.find("0X") == 0) {
+            value = std::stoi(text.substr(2), nullptr, 16);
+        }
+        // Hexadecimal ($NN)
+        else if (text.find("$") == 0) {
+            value = std::stoi(text.substr(1), nullptr, 16);
+        }
+        // Hexadecimal (NNh)
+        else if (text.size() >= 2 && text.back() == 'h') {
+            value = std::stoi(text.substr(0, text.size() - 1), nullptr, 16);
+        }
+        // Binary (0bNNNNNNNN)
+        else if (text.find("0b") == 0 || text.find("0B") == 0) {
+            value = std::stoi(text.substr(2), nullptr, 2);
+        }
+        // Binary (%NNNNNNNN)
+        else if (text.find("%") == 0) {
+            value = std::stoi(text.substr(1), nullptr, 2);
+        }
+        // Try as hex if all hex digits
+        else if (std::all_of(text.begin(), text.end(), [](char c) { 
+            return std::isxdigit(c); 
+        })) {
+            value = std::stoi(text, nullptr, 16);
+        }
+        // Decimal
+        else {
+            value = std::stoi(text);
+        }
+        
+        // Ensure the value fits in a byte
+        if (value < 0 || value > 255) {
+            logger.warning("Value " + std::to_string(value) + " truncated to fit in byte");
+        }
+        
+        return static_cast<uint8_t>(value & 0xFF);
+    }
+    catch (const std::exception& e) {
+        throw std::runtime_error(formatError("Failed to parse byte value: " + std::string(e.what()), token));
     }
 }
 
-// Explicit instantiation
+template<typename AddressT>
+std::string PhaistosParser<AddressT>::formatError(const std::string& message, const Token& token) {
+    std::ostringstream oss;
+    oss << message << " " << token.toString() << std::endl;
+    oss << "Line: " << token.location.line << ": " << Lexer(token.location.filename).getCurrentLine();
+    return oss.str();
+}
+
+// Explicit instantiation for uint16_t
 template class PhaistosParser<uint16_t>;
 
 } // namespace phaistos

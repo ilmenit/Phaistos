@@ -9,6 +9,13 @@
 namespace phaistos {
 
 /**
+ * @brief Helper function to parse numeric values from string
+ * @param text String representation of a number
+ * @return Parsed numeric value
+ */
+uint8_t parseNumeric(const std::string& text);
+
+/**
  * @class Value
  * @brief Represents a value that can be EXACT, ANY, or SAME
  */
