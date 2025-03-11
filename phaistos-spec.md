@@ -23,7 +23,7 @@ The primary purpose of Phaistos is to:
 ### 1.3 Core Features
 
 - **State-based Specification**: Define initial and target CPU/memory states
-- **EXACT/ANY/SAME Parameterization**: Flexible specification of values and constraints
+- **Value Types (EXACT/ANY/SAME/EQU)**: Flexible specification of values and constraints
 - **Cycle-accurate Optimization**: True cycle-counting for speed optimizations
 - **Memory-aware Processing**: Handles memory reads, writes, and self-modifying code
 - **Flag-accurate Execution**: Full support for all CPU status flags
@@ -114,8 +114,8 @@ FLAGS_IN:
 MEMORY_IN:
   ; Format: ADDRESS: [byte values]
   0x1000: 0xA9 0x? 0x85 0x20    ; LDA #? STA $20
-  0x2000: 0x? 0x? 0x? 0x?    ; Four ANY bytes
-  0x0080: 0x01 0x02 0x03 0x04    ; Data in zero page
+  0x2000: :4 0x?                ; Four ANY bytes
+  0x0080: 0x01 0x02 0x03 0x04   ; Data in zero page
 
 ; Code to be optimized
 OPTIMIZE:
@@ -147,7 +147,7 @@ FLAGS_OUT:
 MEMORY_OUT:
   ; Only specify regions that matter
   0x0040: 0x42 0x?     ; First byte must be 0x42, second can be anything
-  0x1000: 0x? 0x? 0x? 0x?  ; Don't care about original code area
+  0x1000: :4 0x?       ; Don't care about original code area
 ```
 
 ### 3.3 Value Representation
@@ -156,10 +156,19 @@ MEMORY_OUT:
 - Binary: `0b10101010` or `%10101010`
 - Decimal: `42`
 - ANY value: `?`, `??`, `ANY`, or with prefix like `0x?` or `$?`
+- Repeated values: `:N value` (e.g., `:4 0x??` for 4 bytes of any value)
+
+All value types work with the repeat notation:
+```
+:4 0x42      ; 4 bytes of exact value 0x42
+:4 0x??      ; 4 bytes of ANY value
+:4 SAME      ; 4 bytes that must match their input values
+:4 EQU       ; 4 bytes that must match original code output
+```
 
 ### 3.4 Meaning of Value Types
 
-The specification includes three value types that have different meanings in input versus output contexts:
+The specification includes four value types that have different meanings in input versus output contexts:
 
 1. **EXACT**: Specifies a precise value
    - In input: The value must be exactly as specified
@@ -172,15 +181,24 @@ The specification includes three value types that have different meanings in inp
 3. **SAME**: Preserves the input value (only valid in output)
    - In output: The value must be preserved from input, whatever it was
 
+4. **EQU**: Functionally equivalent to original code output (only valid in output)
+   - In output: The value must match what the original code in the OPTIMIZE section would produce given the same inputs
+
+> **Important Note**: EXACT and ANY can be used in both input and output contexts, while SAME and EQU can ONLY be used in output contexts. Using SAME or EQU in an input context will result in a specification error.
+
 These value types enable several common patterns:
 
 - **EXACT input → EXACT output**: Transform one specific value to another
 - **EXACT input → ANY output**: "Don't care" about the output value
+- **EXACT input → EQU output**: Produce output equivalent to what the original code would produce
 - **ANY input → EXACT output**: Produce a specific output regardless of input
 - **ANY input → SAME output**: Preserve the value regardless of what it was
+- **ANY input → EQU output**: Transform the input exactly as the original code would
 - **ANY input → ANY output**: Value can be used as a temporary/scratch
 
 The SAME type is particularly important for registers or memory that must be preserved, regardless of their initial values.
+
+The EQU type is critical for ensuring that the optimized code produces the same functional output as the original code, without having to define complex relationships between input and output values.
 
 ### 3.5 Unspecified Values
 
@@ -201,6 +219,21 @@ The `END` marker indicates the termination point of a code block definition. Imp
 - `END` does not add any byte to memory
 - `END` simply marks where the code definition stops
 - `END` is only used for code blocks in OPTIMIZE sections, not for data in MEMORY_IN or MEMORY_OUT sections
+
+### 3.7 RUN Directive
+
+The `RUN` directive specifies the address where execution should begin:
+
+```
+RUN: 0x1000  ; Start execution at address 0x1000
+```
+
+Key characteristics of the `RUN` directive:
+
+- Execution always starts at the specified address
+- If multiple code blocks are defined, only the one at the RUN address (or reachable from it) will be executed
+- For indirect optimization (e.g., optimizing a function called by another routine), `RUN` should point to the calling routine, not the code being optimized
+- If `RUN` is not specified, execution defaults to the start of the first `OPTIMIZE` block
 
 Here's an example with two code blocks:
 
@@ -423,6 +456,13 @@ Verification ensures that a sequence correctly implements the required transform
 3. The resulting state is compared against the required output state
 4. For ANY input values, multiple test cases are generated and verified
 5. For memory correctness, the system verifies that no unauthorized memory locations are modified
+6. For EQU outputs, the original code is executed on the same inputs to generate reference outputs
+
+When verifying code with EQU outputs, the system performs these additional steps:
+1. Tracks all memory locations accessed by the original code
+2. Ensures the optimized code only accesses the same memory locations
+3. Records all outputs produced by the original code for comparison
+4. Verifies that the optimized code produces identical outputs for all test cases
 
 ### 5.6 Algorithm Flow
 
@@ -530,7 +570,7 @@ FLAGS_OUT:
   D: SAME      ; Decimal mode should remain off
 
 MEMORY_OUT:
-  0x80: 0x?? 0x??  ; 16-bit value must be incremented by 1
+  0x80: EQU EQU  ; 16-bit value must be incremented by 1
 ```
 
 **Generated Solution:**
@@ -552,9 +592,31 @@ CPU_IN:
   X: ?  ; Second operand
   Y: 0x00
 
+OPTIMIZE:
+  0x1000:
+    ; This algorithm multiplies A and X by repeated addition
+    ; It performs A * X and stores result in $F1
+    0xA8        ; TAY (preserve A)
+    0xA9 0x00   ; LDA #0 (initialize result)
+    0x86 0xF0   ; STX $F0 (store multiplier)
+    0xC6 0xF0   ; DEC $F0 (adjust for loop logic)
+multiply_loop:
+    0x18        ; CLC
+    0x65 0xF0   ; ADC $F0 (add X to accumulator each iteration)
+    0xC6 0xF0   ; DEC $F0 (decrement counter)
+    0x10 0xF9   ; BPL multiply_loop (loop until negative)
+    0x85 0xF1   ; STA $F1 (store result low byte)
+    0x98        ; TYA (restore original A)
+    END
+
+RUN: 0x1000
+
 CPU_OUT:
-  A: ?  ; Low byte of product
-  Y: ?  ; High byte of product
+  A: SAME       ; Preserve original value
+  Y: SAME       ; Preserve original value
+
+MEMORY_OUT:
+  0xF1: EQU     ; Low byte of product - must match result from original code
 ```
 
 ### 7.3 Memory Block Copy
@@ -564,15 +626,25 @@ CPU_OUT:
 OPTIMIZE_FOR: size
 
 CPU_IN:
-  X = 0x00
-  Y = 0x??  ; Length of copy (1-128 bytes)
+  X: 0x00
+  Y: 0x??  ; Length of copy (1-128 bytes)
 
 MEMORY_IN:
-  0x0200: 0x? [128]  ; Source data (128 bytes)
-  0x0300: 0x? [128]  ; Destination (128 bytes)
+  0x0200: :128 0x?  ; Source data (128 bytes)
+  0x0300: :128 0x?  ; Destination (128 bytes)
+
+OPTIMIZE:
+  0x1000:
+    0xB1 0xFC   ; LDA ($FC),Y - Source pointer at $FC,$FD
+    0x91 0xFE   ; STA ($FE),Y - Destination pointer at $FE,$FF  
+    0x88        ; DEY
+    0x10 0xF9   ; BPL loop
+    END
+
+RUN: 0x1000
 
 MEMORY_OUT:
-  0x0300: 0x? [128]  ; Copied data
+  0x0300: :128 EQU  ; Copied data that matches what original code would produce
 ```
 
 ### 7.4 Code Optimization Example
@@ -591,27 +663,29 @@ OPTIMIZE:
 RUN: 0x1000
 
 MEMORY_OUT:
-  0x20: 0x02    ; Result must be 2
+  0x20: EQU     ; Result must match what original code produces (which is 2)
 ```
+
+**Note**: We could also use `0x20: 0x02` here instead of `EQU` since we know the exact result will always be 2, but using `EQU` is more consistent with the pattern of having the optimizer match the original code's behavior.
 
 ### 7.5 Code Synthesis Example
 
 **Input (`synthesize.pha`):**
 ```
+MEMORY_IN:
+  0x3000: 0x00 0x01 0x02 0x03 0x04
+
 OPTIMIZE:
   0x2000:
     END  ; Empty block - generate code here
 
 RUN: 0x2000
 
-MEMORY_IN:
-  0x3000:
-    0x00 0x01 0x02 0x03 0x04
-
 MEMORY_OUT:
-  0x3000:
-    0x00 0x02 0x04 0x06 0x08  ; Values multiplied by 2
+  0x3000: 0x00 0x02 0x04 0x06 0x08  ; Values multiplied by 2
 ```
+
+**Note**: In this code synthesis example, we use exact values (0x00, 0x02, etc.) rather than EQU because there is no original code to match - we're explicitly defining the desired transformation. This is appropriate for code synthesis where we're generating code from scratch to achieve a specific output.
 
 ### 7.6 Hardware Register Example
 
@@ -636,9 +710,43 @@ RUN: 0x1000
 
 MEMORY_OUT:
   0x80: SAME SAME  ; Coordinates should be preserved
-  0xD000: 0x??     ; Final X coordinate value
-  0xD001: 0x??     ; Final Y coordinate value
+  0xD000: EQU      ; Final X coordinate value
+  0xD001: EQU      ; Final Y coordinate value
   0xD015: 0x01     ; Sprite 0 enabled
+```
+
+### 7.7 Example with Complex Calling Context
+
+**Input (`context_optimize.pha`):**
+```
+MEMORY_IN:
+  0x1000: ; Loop code calling the function we want to optimize
+    0xA2 0x00   ; LDX #$00
+  loop_start:
+    0x20 0x20 0x10 ; JSR function_to_optimize
+    0xE8        ; INX
+    0xE0 0x10   ; CPX #$10
+    0xD0 0xF8   ; BNE loop_start
+    0x60        ; RTS
+  
+  0x2000: :256 0x??  ; Test data array
+
+OPTIMIZE:
+  0x1020: ; Function we want to optimize (16-bit increment)
+    0x18        ; CLC
+    0xA5 0x80   ; LDA $80
+    0x69 0x01   ; ADC #$01
+    0x85 0x80   ; STA $80
+    0xA5 0x81   ; LDA $81
+    0x69 0x00   ; ADC #$00
+    0x85 0x81   ; STA $81
+    0x60        ; RTS
+    END
+ 
+MEMORY_OUT:
+  0x2000: :256 EQU  ; All test data must match what original code would produce
+ 
+RUN: 0x1000  ; Start execution at the loop, not directly at the optimized function
 ```
 
 ## 8. Command Line Interface
@@ -701,13 +809,20 @@ Detailed specification of the .pha file format:
    - `END`: Marks the end of a code block (only used in OPTIMIZE sections)
    - `RUN`: Specifies the execution start address
 
-2. **Value Formats**:
+2. **Value Types**:
+   - `EXACT`: Specific value (default for numeric literals)
+   - `ANY`: Any value (specified with `?`, `??`, or `ANY`)
+   - `SAME`: Must match input value (only for outputs)
+   - `EQU`: Must match what original code would produce (only for outputs)
+
+3. **Value Formats**:
    - Hexadecimal: `0x42`, `$42`, or `42h`
    - Binary: `0b10101010` or `%10101010`
    - Decimal: `42`
    - ANY value: `?`, `??`, `ANY`, `0x?`, or `$?`
+   - Repeated values: `:N value` (e.g., `:4 0x??` for 4 bytes of any value)
 
-3. **Memory Specification**:
+4. **Memory Specification**:
    - Horizontal: `ADDRESS: BYTE1 BYTE2 ...`
    - Vertical:
      ```
@@ -715,8 +830,9 @@ Detailed specification of the .pha file format:
        BYTE1 ; Optional comment
        BYTE2 ; Optional comment
      ```
+   - Repeated: `ADDRESS: :N VALUE` (e.g., `0x2000: :256 0x??`)
 
-4. **Optimization Blocks**:
+5. **Optimization Blocks**:
    - Standard optimization: 
      ```
      OPTIMIZE:

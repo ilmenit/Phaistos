@@ -42,9 +42,10 @@ namespace phaistos {
             FLAG,           // C, Z, I, D, B, V, N
             ADDRESS,        // 0x1000, $FF, etc.
             VALUE,          // Regular value
-            KEYWORD,        // ANY, SAME, END
+            KEYWORD,        // ANY, SAME, END, EQU
             COLON,          // :
             EQUALS,         // =
+            REPEAT,         // :N (e.g., :4 for 4 repeats)
             END_OF_LINE,    // End of a line
             END_OF_FILE     // End of the file
         };
@@ -79,13 +80,20 @@ namespace phaistos {
             TokenType type;
             std::string value;
             SourceLocation location;
+            // For REPEAT tokens, this holds the repeat count
+            size_t repeat_count = 0;
 
             // Default constructor
             Token() : type(TokenType::END_OF_FILE), value(""), location() {}
 
             // Parameterized constructor
             Token(TokenType t, const std::string& v, const SourceLocation& loc)
-                : type(t), value(v), location(loc) {
+                : type(t), value(v), location(loc), repeat_count(0) {
+            }
+
+            // Constructor with repeat count
+            Token(TokenType t, const std::string& v, const SourceLocation& loc, size_t count)
+                : type(t), value(v), location(loc), repeat_count(count) {
             }
 
             std::string toString() const;
@@ -175,6 +183,12 @@ namespace phaistos {
              * @return The number/address token
              */
             Token readNumber();
+            
+            /**
+             * @brief Parse a repeat token (e.g., :4)
+             * @return The repeat token with count set
+             */
+            Token readRepeat();
         };
 
         /**
@@ -195,29 +209,36 @@ namespace phaistos {
          * @brief Parse CPU state (registers)
          * @param lexer The lexer to use
          * @param state The CPU state to update
+         * @param isOutput Whether this is an output state (affects valid value types)
          */
-        void parseCPUState(Lexer& lexer, typename OptimizationSpec<AddressT>::CPUState& state);
+        void parseCPUState(Lexer& lexer, typename OptimizationSpec<AddressT>::CPUState& state, bool isOutput);
 
         /**
          * @brief Parse flag state
          * @param lexer The lexer to use
          * @param flags The flag state to update
+         * @param isOutput Whether this is an output state (affects valid value types)
          */
-        void parseFlagState(Lexer& lexer, typename OptimizationSpec<AddressT>::FlagState& flags);
+        void parseFlagState(Lexer& lexer, typename OptimizationSpec<AddressT>::FlagState& flags, bool isOutput);
 
         /**
          * @brief Parse memory regions
          * @param lexer The lexer to use
          * @param regions The vector of memory regions to update
+         * @param isOutput Whether this is an output state (affects valid value types)
          */
-        void parseMemoryRegions(Lexer& lexer, std::vector<typename OptimizationSpec<AddressT>::MemoryRegion>& regions);
+        void parseMemoryRegions(Lexer& lexer, 
+                               std::vector<typename OptimizationSpec<AddressT>::MemoryRegion>& regions, 
+                               bool isOutput);
 
         /**
          * @brief Parse a memory region
          * @param lexer The lexer to use
+         * @param isOutput Whether this is an output state (affects valid value types)
          * @return The parsed memory region
          */
-        typename OptimizationSpec<AddressT>::MemoryRegion parseMemoryRegion(Lexer& lexer);
+        typename OptimizationSpec<AddressT>::MemoryRegion parseMemoryRegion(
+            Lexer& lexer, bool isOutput);
 
         /**
          * @brief Parse an optimize block
@@ -226,15 +247,6 @@ namespace phaistos {
          * @param readOnly Whether this is a read-only block
          */
         void parseOptimizeBlock(Lexer& lexer, OptimizationSpec<AddressT>& spec, bool readOnly);
-
-        /**
-         * @brief Parse a code block
-         * @param lexer The lexer to use
-         * @param type The type of code block
-         * @return The parsed code block
-         */
-        typename OptimizationSpec<AddressT>::CodeBlock parseCodeBlock(Lexer& lexer,
-            typename OptimizationSpec<AddressT>::CodeBlock::Type type);
 
         /**
          * @brief Parse a run address
@@ -253,9 +265,11 @@ namespace phaistos {
         /**
          * @brief Parse a value
          * @param token The token containing the value
+         * @param isOutput Whether this is an output context
          * @return The parsed value
+         * @throws std::runtime_error if SAME or EQU are used in input context
          */
-        Value parseValue(const Token& token);
+        Value parseValue(const Token& token, bool isOutput = false);
 
         /**
          * @brief Parse a byte value
@@ -271,6 +285,16 @@ namespace phaistos {
          * @return Formatted error message
          */
         std::string formatError(const std::string& message, const Token& token);
+        
+        /**
+         * @brief Parse values for a memory region
+         * @param lexer The lexer to use
+         * @param region The region to update
+         * @param isOutput Whether this is an output context
+         */
+        void parseMemoryValues(Lexer& lexer, 
+                              typename OptimizationSpec<AddressT>::MemoryRegion& region,
+                              bool isOutput);
     };
 
 } // namespace phaistos

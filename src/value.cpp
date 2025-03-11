@@ -59,8 +59,7 @@ Value Value::parse(const std::string& text) {
 
     // Handle ANY variants
     if (text == "??" || text == "?" || text == "ANY" || 
-        text.find("0x?") != std::string::npos ||
-        text.find("$?") != std::string::npos) {
+        text.find("?") != std::string::npos) {
         logger.debug("  Detected ANY value");
         return any();
     }
@@ -69,6 +68,12 @@ Value Value::parse(const std::string& text) {
     if (text == "SAME") {
         logger.debug("  Detected SAME value");
         return same();
+    }
+    
+    // Handle EQU keyword for code equivalence
+    if (text == "EQU") {
+        logger.debug("  Detected EQU value");
+        return equ();
     }
     
     // Parse as exact value

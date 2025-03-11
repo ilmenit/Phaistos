@@ -1,6 +1,6 @@
 /**
  * @file value.hpp
- * @brief Value type for representing EXACT, ANY, and SAME values
+ * @brief Value type for representing EXACT, ANY, SAME, and EQU values
  */
 #pragma once
 
@@ -17,7 +17,7 @@ uint8_t parseNumeric(const std::string& text);
 
 /**
  * @class Value
- * @brief Represents a value that can be EXACT, ANY, or SAME
+ * @brief Represents a value that can be EXACT, ANY, SAME, or EQU
  */
 class Value {
 public:
@@ -25,7 +25,7 @@ public:
      * @enum Type
      * @brief The type of value
      */
-    enum Type { EXACT, ANY, SAME };
+    enum Type { EXACT, ANY, SAME, EQU };
 
     /**
      * @brief Default constructor creates an ANY value
@@ -62,6 +62,14 @@ public:
      */
     static Value same() {
         return Value(SAME, 0);
+    }
+
+    /**
+     * @brief Factory method for creating an EQU value
+     * @return An EQU Value
+     */
+    static Value equ() {
+        return Value(EQU, 0);
     }
 
     /**

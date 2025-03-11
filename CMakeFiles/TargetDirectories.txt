@@ -1,0 +1,7 @@
+/home/mint/Documents/GitHub/Phaistos/CMakeFiles/phaistos.dir
+/home/mint/Documents/GitHub/Phaistos/CMakeFiles/edit_cache.dir
+/home/mint/Documents/GitHub/Phaistos/CMakeFiles/rebuild_cache.dir
+/home/mint/Documents/GitHub/Phaistos/CMakeFiles/list_install_components.dir
+/home/mint/Documents/GitHub/Phaistos/CMakeFiles/install.dir
+/home/mint/Documents/GitHub/Phaistos/CMakeFiles/install/local.dir
+/home/mint/Documents/GitHub/Phaistos/CMakeFiles/install/strip.dir
